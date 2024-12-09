@@ -1,10 +1,9 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use binius_core::linear_code::LinearCode;
 use binius_core::reed_solomon::reed_solomon::ReedSolomonCode;
-use binius_field::{arithmetic_traits::TaggedMul, BinaryField128b, BinaryField8b, Field};
-use binius_hash::{GroestlDigest, GroestlDigestCompression, GroestlHasher, HashDigest};
-use sha2::{Digest};
-use rs_merkle::{MerkleTree, algorithms::Sha256};
+use binius_field::BinaryField128b;
+use rs_merkle::{algorithms::Sha256, Hasher, MerkleTree};
+use sha2::Digest;
 
 pub type Felt = BinaryField128b;
 
@@ -14,51 +13,90 @@ pub struct DataSquare {
     width: usize,
 }
 
+pub struct ExtendedDataSquare {
+    cols: Vec<Vec<Felt>>,
+    rows: Vec<Vec<Felt>>,
+    dr: Vec<Felt>,
+    //TODO: row_roots, col_roots
+}
+
+impl ExtendedDataSquare {
+    fn from_cols(
+        q1: Vec<Vec<Felt>>,
+        q2: Vec<Vec<Felt>>,
+        q3: Vec<Vec<Felt>>,
+        q4: Vec<Vec<Felt>>,
+        dr: Vec<Felt>,
+    ) -> Self {
+        // step 1: combine q1 and q3
+        let mut left_cols = q1.clone();
+        for col in left_cols.iter_mut().zip(q3) {
+            col.0.extend(col.1);
+        }
+
+        // step 2: combine q2 and q4
+        let mut right_cols = q2.clone();
+        for col in right_cols.iter_mut().zip(q4) {
+            col.0.extend(col.1);
+        }
+
+        // step 3: combine left and right cols
+        let mut cols = left_cols.clone();
+        cols.extend(right_cols);
+
+        let rows = transpose(cols.clone());
+
+        Self { cols, rows, dr }
+    }
+}
+
 impl DataSquare {
     // Extend the data square using Reed-Solomon encoding
-    pub fn extend(&mut self) -> Result<()> {
-        // Create a new tensor to store the extended columns
-        let mut q3 = Vec::with_capacity(self.cols.len());
+    pub fn extend(&mut self) -> Result<ExtendedDataSquare> {
+        let q3_cols = self.create_q3()?;
+        let tree = self.create_tree(q3_cols.clone())?;
+        let root = match tree.root() {
+            Some(r) => r,
+            None => bail!("failed to get tree commitment"),
+        };
 
-        // Process each column
+        let dr = self.create_dr(&root);
+
+        let q2_rows = self.commit_and_extend(dr.clone(), self.cols.clone());
+        let q4_rows = self.commit_and_extend(dr, q3_cols);
+        Ok(())
+    }
+
+    pub fn create_q3(&self) -> Result<Vec<Vec<Felt>>> {
+        let mut q3: Vec<Vec<Felt>> = Vec::new();
         for col in self.cols.iter() {
-            let mut extended_col = col.clone();
+            let extended_col = col.clone();
             let new_col = self.encoder.encode(extended_col)?;
             q3.push(new_col);
         }
+        Ok(q3)
+    }
 
-        // self.cols = extended_cols.clone();
+    pub fn create_tree(&self, q3_cols: Vec<Vec<Felt>>) -> Result<MerkleTree<Sha256>> {
         let mut rows = transpose(self.cols.clone());
-        let q3_rows = transpose(q3.clone());
+        let q3_rows = transpose(q3_cols.clone());
         rows.extend(q3_rows);
 
-        // TODO CRIT
-        // let elements: Vec<BinaryField128b> = transpose(extended_cols).iter().flatten().collect();
-        let merkle_leaves = rows
+        let merkle_leaves: Vec<[u8; 32]> = rows
             .iter()
             .flatten()
-            .map(|elem| Sha256::hash(elem));
+            .map(|elem| Sha256::hash(elem.val().to_be_bytes().as_ref()))
             .collect();
 
-        let simple_tree = MerkleTree::<Sha256>::from_leaves(&merkle_leaves);
+        Ok(MerkleTree::<Sha256>::from_leaves(&merkle_leaves))
+    }
 
-        let tree = BinaryMerkleTree::<BinaryField128b>::build::<_, GroestlHasher<_>, _>(
-            &GroestlDigestCompression::<BinaryField8b>::default(),
-            elements.as_slice(),
-            extended_cols.len(),
-        )?;
-
-        let root = tree.root();
-        let merkle_commitment: u128 = root.val();
-
-        // Creating the Dr vector from the entropy of the merkle commitment
-        // TODO: find better name
+    pub fn create_dr(&self, tree_commitment: &[u8; 32]) -> Vec<Felt> {
         let mut dr: Vec<Felt> = Vec::new();
         for dr_i in 0..self.width {
             let mut hasher = sha2::Sha256::new();
-            hasher.update(merkle_commitment.to_be_bytes());
-            // fix this bad rust
-            hasher.update(&vec![dr_i as u8]);
+            hasher.update(tree_commitment);
+            hasher.update(dr_i.to_be_bytes());
             let digest = hasher.finalize();
             // truncate digest to 128 bits to make it into a felt
             // todo: don't make so nested
@@ -66,10 +104,7 @@ impl DataSquare {
                 digest[0..16].try_into().unwrap(),
             )));
         }
-
-        let q2 = self.commit_and_extend(dr, extended_cols[..self.width].to_vec());
-        let q4 = self.commit_and_extend(dr, extended_cols[self.width..].to_vec());
-        Ok(())
+        dr
     }
 
     pub(crate) fn commit_and_extend(
@@ -83,8 +118,8 @@ impl DataSquare {
         for i in 0..width {
             let mut new_col = Vec::new();
             let original_col = column_data[i].clone();
-            for j in 0..width {
-                new_col.push(dr[i] * original_col[j]);
+            for elem in original_col.iter() {
+                new_col.push(dr[i] * elem);
             }
             new_quadrant.push(new_col);
         }
@@ -103,8 +138,8 @@ pub fn transpose(matrix: Vec<Vec<Felt>>) -> Vec<Vec<Felt>> {
     let mut transposed = Vec::new();
     for i in 0..matrix.len() {
         let mut row = Vec::new();
-        for j in 0..matrix.len() {
-            row.push(matrix[j][i]);
+        for col in matrix.iter() {
+            row.push(col[i]);
         }
         transposed.push(row);
     }

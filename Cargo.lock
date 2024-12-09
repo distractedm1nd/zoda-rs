@@ -548,19 +548,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsmt2d"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "binius_core",
- "binius_field",
- "binius_hash",
- "rand",
- "rs_merkle",
- "sha2",
-]
-
-[[package]]
 name = "rustc_version"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -811,4 +798,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.90",
+]
+
+[[package]]
+name = "zoda-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "binius_core",
+ "binius_field",
+ "binius_hash",
+ "rand",
+ "rs_merkle",
+ "sha2",
 ]
