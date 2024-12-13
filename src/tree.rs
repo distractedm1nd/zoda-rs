@@ -70,8 +70,7 @@ impl DataSquare {
     // Extend the data square using Reed-Solomon encoding
     pub fn extend(&mut self) -> Result<ExtendedDataSquare> {
         let q3_cols = self.create_q3()?;
-        let x_tree =
-            self.create_tree(transpose(self.q1_cols.clone()), transpose(q3_cols.clone()))?;
+        let x_tree = self.create_tree(transpose(&self.q1_cols), transpose(&q3_cols))?;
         let root = match x_tree.root() {
             Some(r) => r,
             None => bail!("failed to get tree commitment"),
@@ -79,22 +78,33 @@ impl DataSquare {
 
         let dr = self.create_dr(&root);
 
-        let q2_rows = self.commit_and_extend(dr.clone(), self.q1_cols.clone())?;
-        let q4_rows = self.commit_and_extend(dr.clone(), q3_cols.clone())?;
+        let mut q1_dr_cols = self.q1_cols.clone();
+        let mut q3_dr_cols = q3_cols.clone();
+        self.multiply_dr(&mut q1_dr_cols, &dr);
+        self.multiply_dr(&mut q3_dr_cols, &dr);
 
-        let y_tree = self.create_tree(self.q1_cols.clone(), q3_cols.clone())?;
+        let q2_rows = self.extend_quadrant(&q1_dr_cols)?;
+        let q4_rows = self.extend_quadrant(&q3_dr_cols)?;
+
+        let y_tree = self.create_tree(q1_dr_cols.clone(), transpose(&q2_rows))?;
 
         let eds = ExtendedDataSquare::from_cols(
             self.q1_cols.clone(),
-            transpose(q2_rows),
+            transpose(&q2_rows),
             q3_cols,
-            transpose(q4_rows),
+            transpose(&q4_rows),
             dr,
             x_tree,
             y_tree,
         );
 
         Ok(eds)
+    }
+
+    pub fn multiply_dr(&self, matrix: &mut [Vec<Felt>], dr: &[Felt]) {
+        for (i, repr) in matrix.iter_mut().enumerate() {
+            repr.iter_mut().for_each(|elem| *elem *= dr[i]);
+        }
     }
 
     pub fn create_q3(&self) -> Result<Vec<Vec<Felt>>> {
@@ -109,14 +119,11 @@ impl DataSquare {
 
     pub fn create_tree(
         &self,
-        matrix_1: Vec<Vec<Felt>>,
-        matrix_2: Vec<Vec<Felt>>,
+        matrix_1: &[Vec<Felt>],
+        matrix_2: &[Vec<Felt>],
     ) -> Result<MerkleTree<Sha256>> {
-        let mut repr = matrix_1.clone();
-        repr.extend(matrix_2);
-        // let mut rows = transpose(self.q1_cols.clone());
-        // let q3_rows = transpose(q3_cols.clone());
-        // rows.extend(q3_rows);
+        // OH: "this is kinda retarded, we are already looking at all the elements when we transpose, and then we flatten anyways"
+        let repr = matrix_1.iter().chain(matrix_2.iter()).collect::<Vec<_>>();
 
         let merkle_leaves: Vec<[u8; 32]> = repr
             .iter()
@@ -143,34 +150,18 @@ impl DataSquare {
         dr
     }
 
-    pub(crate) fn commit_and_extend(
-        &self,
-        dr: Vec<Felt>,
-        column_data: Vec<Vec<Felt>>,
-    ) -> Result<Vec<Vec<Felt>>> {
-        let mut new_quadrant: Vec<Vec<Felt>> = Vec::new();
-        let width = column_data.len();
-
-        for i in 0..width {
-            let mut new_col = Vec::new();
-            let original_col = column_data[i].clone();
-            for elem in original_col.iter() {
-                new_col.push(dr[i] * elem);
-            }
-            new_quadrant.push(new_col);
-        }
-
-        let mut final_quadrant: Vec<Vec<Felt>> = Vec::new();
-        for row in transpose(new_quadrant).iter() {
+    pub(crate) fn extend_quadrant(&self, column_data: &[Vec<Felt>]) -> Result<Vec<Vec<Felt>>> {
+        let mut extended_quadrant: Vec<Vec<Felt>> = Vec::new();
+        for row in transpose(column_data).iter() {
             let encoded = self.encoder.encode(row.clone())?;
-            final_quadrant.push(encoded)
+            extended_quadrant.push(encoded)
         }
 
-        Ok(final_quadrant)
+        Ok(extended_quadrant)
     }
 }
 
-pub fn transpose(matrix: Vec<Vec<Felt>>) -> Vec<Vec<Felt>> {
+pub fn transpose(matrix: &[Vec<Felt>]) -> Vec<Vec<Felt>> {
     let mut transposed = Vec::new();
     for i in 0..matrix.len() {
         let mut row = Vec::new();
@@ -178,6 +169,16 @@ pub fn transpose(matrix: Vec<Vec<Felt>>) -> Vec<Vec<Felt>> {
             row.push(col[i]);
         }
         transposed.push(row);
+    }
+    transposed
+}
+
+pub fn transpose_and_flatten(matrix: &[Vec<Felt>]) -> Vec<Felt> {
+    let mut transposed = Vec::new();
+    for i in 0..matrix.len() {
+        for col in matrix.iter() {
+            transposed.push(col[i]);
+        }
     }
     transposed
 }
