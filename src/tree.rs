@@ -9,7 +9,7 @@ pub type Felt = BinaryField128b;
 
 pub struct DataSquare {
     encoder: ReedSolomonCode<Felt>,
-    cols: Vec<Vec<Felt>>,
+    q1_cols: Vec<Vec<Felt>>,
     width: usize,
 }
 
@@ -17,6 +17,14 @@ pub struct ExtendedDataSquare {
     cols: Vec<Vec<Felt>>,
     rows: Vec<Vec<Felt>>,
     dr: Vec<Felt>,
+
+    // over columns of (q1, q3)
+    x_tree: MerkleTree<Sha256>,
+    // over rows of (q1, q2)
+    y_tree: MerkleTree<Sha256>,
+    // over all quadrants (todo: what representation?)
+    // z_tree: MerkleTree<Sha256>,
+
     //TODO: row_roots, col_roots
 }
 
@@ -27,6 +35,8 @@ impl ExtendedDataSquare {
         q3: Vec<Vec<Felt>>,
         q4: Vec<Vec<Felt>>,
         dr: Vec<Felt>,
+        x_tree: MerkleTree<Sha256>,
+        y_tree: MerkleTree<Sha256>,
     ) -> Self {
         // step 1: combine q1 and q3
         let mut left_cols = q1.clone();
@@ -46,7 +56,13 @@ impl ExtendedDataSquare {
 
         let rows = transpose(cols.clone());
 
-        Self { cols, rows, dr }
+        Self {
+            cols,
+            rows,
+            dr,
+            x_tree,
+            y_tree,
+        }
     }
 }
 
@@ -54,22 +70,36 @@ impl DataSquare {
     // Extend the data square using Reed-Solomon encoding
     pub fn extend(&mut self) -> Result<ExtendedDataSquare> {
         let q3_cols = self.create_q3()?;
-        let tree = self.create_tree(q3_cols.clone())?;
-        let root = match tree.root() {
+        let x_tree =
+            self.create_tree(transpose(self.q1_cols.clone()), transpose(q3_cols.clone()))?;
+        let root = match x_tree.root() {
             Some(r) => r,
             None => bail!("failed to get tree commitment"),
         };
 
         let dr = self.create_dr(&root);
 
-        let q2_rows = self.commit_and_extend(dr.clone(), self.cols.clone());
-        let q4_rows = self.commit_and_extend(dr, q3_cols);
-        Ok(())
+        let q2_rows = self.commit_and_extend(dr.clone(), self.q1_cols.clone())?;
+        let q4_rows = self.commit_and_extend(dr.clone(), q3_cols.clone())?;
+
+        let y_tree = self.create_tree(self.q1_cols.clone(), q3_cols.clone())?;
+
+        let eds = ExtendedDataSquare::from_cols(
+            self.q1_cols.clone(),
+            transpose(q2_rows),
+            q3_cols,
+            transpose(q4_rows),
+            dr,
+            x_tree,
+            y_tree,
+        );
+
+        Ok(eds)
     }
 
     pub fn create_q3(&self) -> Result<Vec<Vec<Felt>>> {
         let mut q3: Vec<Vec<Felt>> = Vec::new();
-        for col in self.cols.iter() {
+        for col in self.q1_cols.iter() {
             let extended_col = col.clone();
             let new_col = self.encoder.encode(extended_col)?;
             q3.push(new_col);
@@ -77,12 +107,18 @@ impl DataSquare {
         Ok(q3)
     }
 
-    pub fn create_tree(&self, q3_cols: Vec<Vec<Felt>>) -> Result<MerkleTree<Sha256>> {
-        let mut rows = transpose(self.cols.clone());
-        let q3_rows = transpose(q3_cols.clone());
-        rows.extend(q3_rows);
+    pub fn create_tree(
+        &self,
+        matrix_1: Vec<Vec<Felt>>,
+        matrix_2: Vec<Vec<Felt>>,
+    ) -> Result<MerkleTree<Sha256>> {
+        let mut repr = matrix_1.clone();
+        repr.extend(matrix_2);
+        // let mut rows = transpose(self.q1_cols.clone());
+        // let q3_rows = transpose(q3_cols.clone());
+        // rows.extend(q3_rows);
 
-        let merkle_leaves: Vec<[u8; 32]> = rows
+        let merkle_leaves: Vec<[u8; 32]> = repr
             .iter()
             .flatten()
             .map(|elem| Sha256::hash(elem.val().to_be_bytes().as_ref()))
