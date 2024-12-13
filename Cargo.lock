@@ -808,6 +808,7 @@ dependencies = [
  "binius_core",
  "binius_field",
  "binius_hash",
+ "binius_ntt",
  "rand",
  "rs_merkle",
  "sha2",

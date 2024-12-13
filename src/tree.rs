@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use binius_core::linear_code::LinearCode;
 use binius_core::reed_solomon::reed_solomon::ReedSolomonCode;
+use binius_ntt::NTTOptions;
 use binius_field::BinaryField128b;
 use rs_merkle::{algorithms::Sha256, Hasher, MerkleTree};
 use sha2::Digest;
@@ -21,7 +22,7 @@ pub struct ExtendedDataSquare {
     // over columns of (q1, q3)
     x_tree: MerkleTree<Sha256>,
     // over rows of (q1, q2)
-    y_tree: MerkleTree<Sha256>,
+    z_tree: MerkleTree<Sha256>,
     // over all quadrants (todo: what representation?)
     // z_tree: MerkleTree<Sha256>,
 
@@ -36,7 +37,7 @@ impl ExtendedDataSquare {
         q4: Vec<Vec<Felt>>,
         dr: Vec<Felt>,
         x_tree: MerkleTree<Sha256>,
-        y_tree: MerkleTree<Sha256>,
+        z_tree: MerkleTree<Sha256>,
     ) -> Self {
         // step 1: combine q1 and q3
         let mut left_cols = q1.clone();
@@ -54,14 +55,14 @@ impl ExtendedDataSquare {
         let mut cols = left_cols.clone();
         cols.extend(right_cols);
 
-        let rows = transpose(cols.clone());
+        let rows = transpose(&cols);
 
         Self {
             cols,
             rows,
             dr,
             x_tree,
-            y_tree,
+            z_tree,
         }
     }
 }
@@ -70,7 +71,7 @@ impl DataSquare {
     // Extend the data square using Reed-Solomon encoding
     pub fn extend(&mut self) -> Result<ExtendedDataSquare> {
         let q3_cols = self.create_q3()?;
-        let x_tree = self.create_tree(transpose(&self.q1_cols), transpose(&q3_cols))?;
+        let x_tree = self.create_tree(vec![transpose(&self.q1_cols).as_slice(), transpose(&q3_cols).as_slice()])?;
         let root = match x_tree.root() {
             Some(r) => r,
             None => bail!("failed to get tree commitment"),
@@ -86,7 +87,12 @@ impl DataSquare {
         let q2_rows = self.extend_quadrant(&q1_dr_cols)?;
         let q4_rows = self.extend_quadrant(&q3_dr_cols)?;
 
-        let y_tree = self.create_tree(q1_dr_cols.clone(), transpose(&q2_rows))?;
+        let z_tree = self.create_tree(vec![
+            q1_dr_cols.as_slice(),
+            transpose(&q2_rows).as_slice(),
+            q3_dr_cols.as_slice(),
+            transpose(&q4_rows).as_slice(),
+        ])?;
 
         let eds = ExtendedDataSquare::from_cols(
             self.q1_cols.clone(),
@@ -95,7 +101,7 @@ impl DataSquare {
             transpose(&q4_rows),
             dr,
             x_tree,
-            y_tree,
+            z_tree,
         );
 
         Ok(eds)
@@ -119,15 +125,13 @@ impl DataSquare {
 
     pub fn create_tree(
         &self,
-        matrix_1: &[Vec<Felt>],
-        matrix_2: &[Vec<Felt>],
+        matrices: Vec<&[Vec<Felt>]>,
     ) -> Result<MerkleTree<Sha256>> {
-        // OH: "this is kinda retarded, we are already looking at all the elements when we transpose, and then we flatten anyways"
-        let repr = matrix_1.iter().chain(matrix_2.iter()).collect::<Vec<_>>();
+        let repr = matrices.iter().flat_map(|matrix| matrix.iter()).collect::<Vec<_>>();
 
         let merkle_leaves: Vec<[u8; 32]> = repr
             .iter()
-            .flatten()
+            .flat_map(|vec| vec.iter())
             .map(|elem| Sha256::hash(elem.val().to_be_bytes().as_ref()))
             .collect();
 
@@ -181,4 +185,50 @@ pub fn transpose_and_flatten(matrix: &[Vec<Felt>]) -> Vec<Felt> {
         }
     }
     transposed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rs_merkle::MerkleTree;
+    use rs_merkle::algorithms::Sha256;
+
+    fn create_test_data_square() -> DataSquare {
+        // Create a simple DataSquare for testing
+        let ntt_options = NTTOptions::default(); // Ensure this is correctly initialized
+        let encoder = ReedSolomonCode::new(2, 1, ntt_options).unwrap(); // Adjust parameters
+        let q1_cols = vec![vec![Felt::new(1), Felt::new(2)], vec![Felt::new(3), Felt::new(4)]];
+        let width = 2;
+        DataSquare { encoder, q1_cols, width }
+    }
+
+    #[test]
+    fn test_extend() {
+        let mut data_square = create_test_data_square();
+        let result = data_square.extend();
+
+        
+        let extended_data_square = result.unwrap();
+        assert_eq!(extended_data_square.cols.len(), 4, "Incorrect number of columns");
+        assert_eq!(extended_data_square.rows.len(), 4, "Incorrect number of rows");
+    }
+
+    #[test]
+    fn test_create_tree() {
+        let data_square = create_test_data_square();
+        let matrices = vec![data_square.q1_cols.as_slice()]; // Convert Vec to slice
+        let result = data_square.create_tree(matrices);
+        assert!(result.is_ok(), "Failed to create Merkle tree");
+        
+        let tree = result.unwrap();
+        assert!(tree.root().is_some(), "Merkle tree root is None");
+    }
+
+    #[test]
+    fn test_create_dr() {
+        let data_square = create_test_data_square();
+        let dummy_commitment = [0u8; 32];
+        let dr = data_square.create_dr(&dummy_commitment);
+        assert_eq!(dr.len(), data_square.width, "Incorrect dr length");
+    }
 }
